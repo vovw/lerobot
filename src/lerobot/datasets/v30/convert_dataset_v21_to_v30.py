@@ -36,7 +36,7 @@ python src/lerobot/datasets/v30/convert_dataset_v21_to_v30.py \
 import argparse
 import shutil
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable, Sequence
 
 import jsonlines
 import pandas as pd
@@ -172,13 +172,25 @@ def concat_data_files(paths_to_cat, new_root, chunk_idx, file_idx, image_keys):
     concatenated_df.to_parquet(path, index=False, schema=schema)
 
 
-def convert_data(root: Path, new_root: Path, data_file_size_in_mb: int):
+def convert_data(
+    root: Path,
+    new_root: Path,
+    data_file_size_in_mb: int,
+    selected_episode_indices: Sequence[int] | None = None,
+):
     data_dir = root / "data"
-    ep_paths = sorted(data_dir.glob("*/*.parquet"))
+    all_ep_paths = sorted(data_dir.glob("*/*.parquet"))
+
+    if selected_episode_indices is None:
+        ep_paths = all_ep_paths
+        original_indices = list(range(len(all_ep_paths)))
+    else:
+        ep_paths = [p for i, p in enumerate(all_ep_paths) if i in set(selected_episode_indices)]
+        original_indices = [i for i in range(len(all_ep_paths)) if i in set(selected_episode_indices)]
 
     image_keys = get_image_keys(root)
 
-    ep_idx = 0
+    local_ep_idx = 0
     chunk_idx = 0
     file_idx = 0
     size_in_mb = 0
@@ -189,7 +201,7 @@ def convert_data(root: Path, new_root: Path, data_file_size_in_mb: int):
         ep_size_in_mb = get_parquet_file_size_in_mb(ep_path)
         ep_num_frames = get_parquet_num_frames(ep_path)
         ep_metadata = {
-            "episode_index": ep_idx,
+            "episode_index": local_ep_idx,
             "data/chunk_index": chunk_idx,
             "data/file_index": file_idx,
             "dataset_from_index": num_frames,
@@ -198,7 +210,7 @@ def convert_data(root: Path, new_root: Path, data_file_size_in_mb: int):
         size_in_mb += ep_size_in_mb
         num_frames += ep_num_frames
         episodes_metadata.append(ep_metadata)
-        ep_idx += 1
+        local_ep_idx += 1
 
         if size_in_mb < data_file_size_in_mb:
             paths_to_cat.append(ep_path)
@@ -218,7 +230,7 @@ def convert_data(root: Path, new_root: Path, data_file_size_in_mb: int):
     if paths_to_cat:
         concat_data_files(paths_to_cat, new_root, chunk_idx, file_idx, image_keys)
 
-    return episodes_metadata
+    return episodes_metadata, original_indices
 
 
 def get_video_keys(root):
@@ -235,7 +247,12 @@ def get_image_keys(root):
     return image_keys
 
 
-def convert_videos(root: Path, new_root: Path, video_file_size_in_mb: int):
+def convert_videos(
+    root: Path,
+    new_root: Path,
+    video_file_size_in_mb: int,
+    selected_episode_indices: Sequence[int] | None = None,
+):
     video_keys = get_video_keys(root)
     if len(video_keys) == 0:
         return None
@@ -244,7 +261,9 @@ def convert_videos(root: Path, new_root: Path, video_file_size_in_mb: int):
 
     eps_metadata_per_cam = []
     for camera in video_keys:
-        eps_metadata = convert_videos_of_camera(root, new_root, camera, video_file_size_in_mb)
+        eps_metadata = convert_videos_of_camera(
+            root, new_root, camera, video_file_size_in_mb, selected_episode_indices
+        )
         eps_metadata_per_cam.append(eps_metadata)
 
     num_eps_per_cam = [len(eps_cam_map) for eps_cam_map in eps_metadata_per_cam]
@@ -269,10 +288,21 @@ def convert_videos(root: Path, new_root: Path, video_file_size_in_mb: int):
     return episods_metadata
 
 
-def convert_videos_of_camera(root: Path, new_root: Path, video_key: str, video_file_size_in_mb: int):
+def convert_videos_of_camera(
+    root: Path,
+    new_root: Path,
+    video_key: str,
+    video_file_size_in_mb: int,
+    selected_episode_indices: Sequence[int] | None = None,
+):
     # Access old paths to mp4
     videos_dir = root / "videos"
-    ep_paths = sorted(videos_dir.glob(f"*/{video_key}/*.mp4"))
+    all_ep_paths = sorted(videos_dir.glob(f"*/{video_key}/*.mp4"))
+    if selected_episode_indices is None:
+        ep_paths = all_ep_paths
+    else:
+        selected_set = set(selected_episode_indices)
+        ep_paths = [p for i, p in enumerate(all_ep_paths) if i in selected_set]
 
     ep_idx = 0
     chunk_idx = 0
@@ -340,23 +370,21 @@ def convert_videos_of_camera(root: Path, new_root: Path, video_key: str, video_f
 
 
 def generate_episode_metadata_dict(
-    episodes_legacy_metadata, episodes_metadata, episodes_stats, episodes_videos=None
+    episodes_legacy_metadata_list: list[dict],
+    episodes_metadata: list[dict],
+    episodes_stats_list: list[dict],
+    episodes_videos: list[dict] | None = None,
 ):
     num_episodes = len(episodes_metadata)
-    episodes_legacy_metadata_vals = list(episodes_legacy_metadata.values())
-    episodes_stats_vals = list(episodes_stats.values())
-    episodes_stats_keys = list(episodes_stats.keys())
+    episodes_legacy_metadata_vals = episodes_legacy_metadata_list
+    episodes_stats_vals = episodes_stats_list
 
     for i in range(num_episodes):
         ep_legacy_metadata = episodes_legacy_metadata_vals[i]
         ep_metadata = episodes_metadata[i]
         ep_stats = episodes_stats_vals[i]
 
-        ep_ids_set = {
-            ep_legacy_metadata["episode_index"],
-            ep_metadata["episode_index"],
-            episodes_stats_keys[i],
-        }
+        ep_ids_set = {ep_legacy_metadata["episode_index"], ep_metadata["episode_index"]}
 
         if episodes_videos is None:
             ep_video = {}
@@ -373,25 +401,42 @@ def generate_episode_metadata_dict(
         yield ep_dict
 
 
-def convert_episodes_metadata(root, new_root, episodes_metadata, episodes_video_metadata=None):
-    episodes_legacy_metadata = legacy_load_episodes(root)
-    episodes_stats = legacy_load_episodes_stats(root)
+def convert_episodes_metadata(
+    root: Path,
+    new_root: Path,
+    episodes_metadata: list[dict],
+    episodes_video_metadata: list[dict] | None = None,
+    selected_original_episode_indices: Sequence[int] | None = None,
+):
+    legacy_all = legacy_load_episodes(root)
+    stats_all = legacy_load_episodes_stats(root)
 
-    num_eps_set = {len(episodes_legacy_metadata), len(episodes_metadata)}
+    if selected_original_episode_indices is None:
+        selected_original_episode_indices = list(range(len(episodes_metadata)))
+
+    # Build lists aligned with local ordering and reindex legacy/stats to local indices
+    episodes_legacy_metadata_list: list[dict] = []
+    episodes_stats_list: list[dict] = []
+    for local_idx, original_idx in enumerate(selected_original_episode_indices):
+        legacy_entry = legacy_all[original_idx].copy()
+        legacy_entry["episode_index"] = local_idx
+        episodes_legacy_metadata_list.append(legacy_entry)
+        episodes_stats_list.append(stats_all[original_idx])
+
+    num_eps_set = {len(episodes_legacy_metadata_list), len(episodes_metadata)}
     if episodes_video_metadata is not None:
         num_eps_set.add(len(episodes_video_metadata))
-
     if len(num_eps_set) != 1:
         raise ValueError(f"Number of episodes is not the same ({num_eps_set}).")
 
     ds_episodes = Dataset.from_generator(
         lambda: generate_episode_metadata_dict(
-            episodes_legacy_metadata, episodes_metadata, episodes_stats, episodes_video_metadata
+            episodes_legacy_metadata_list, episodes_metadata, episodes_stats_list, episodes_video_metadata
         )
     )
     write_episodes(ds_episodes, new_root)
 
-    stats = aggregate_stats(list(episodes_stats.values()))
+    stats = aggregate_stats(episodes_stats_list)
     write_stats(stats, new_root)
 
 
@@ -418,54 +463,85 @@ def convert_dataset(
     branch: str | None = None,
     data_file_size_in_mb: int | None = None,
     video_file_size_in_mb: int | None = None,
+    num_shards: int | None = None,
+    shard_index: int | None = None,
+    out_repo_id: str | None = None,
+    push_to_hub: bool = True,
 ):
-    root = HF_LEROBOT_HOME / repo_id
-    old_root = HF_LEROBOT_HOME / f"{repo_id}_old"
-    new_root = HF_LEROBOT_HOME / f"{repo_id}_v30"
+    # Determine source (v2.1) download location
+    if num_shards is not None and shard_index is not None:
+        src_root = HF_LEROBOT_HOME / f"{repo_id}_v21_src_world_{num_shards}_rank_{shard_index}"
+    else:
+        src_root = HF_LEROBOT_HOME / f"{repo_id}_v21_src"
+
+    # Determine output repo id and paths
+    if num_shards is not None and shard_index is not None:
+        out_repo_id = out_repo_id or f"{repo_id}_world_{num_shards}_rank_{shard_index}"
+    else:
+        out_repo_id = out_repo_id or repo_id
+
+    root = HF_LEROBOT_HOME / out_repo_id
+    tmp_root = HF_LEROBOT_HOME / f"{out_repo_id}_v30tmp"
 
     if data_file_size_in_mb is None:
         data_file_size_in_mb = DEFAULT_DATA_FILE_SIZE_IN_MB
     if video_file_size_in_mb is None:
         video_file_size_in_mb = DEFAULT_VIDEO_FILE_SIZE_IN_MB
 
-    if old_root.is_dir() and root.is_dir():
-        shutil.rmtree(str(root))
-        shutil.move(str(old_root), str(root))
-
-    if new_root.is_dir():
-        shutil.rmtree(new_root)
+    if tmp_root.is_dir():
+        shutil.rmtree(tmp_root)
 
     snapshot_download(
         repo_id,
         repo_type="dataset",
         revision=V21,
-        local_dir=root,
+        local_dir=src_root,
     )
 
-    convert_info(root, new_root, data_file_size_in_mb, video_file_size_in_mb)
-    convert_tasks(root, new_root)
-    episodes_metadata = convert_data(root, new_root, data_file_size_in_mb)
-    episodes_videos_metadata = convert_videos(root, new_root, video_file_size_in_mb)
-    convert_episodes_metadata(root, new_root, episodes_metadata, episodes_videos_metadata)
+    # Sharding: select episode indices processed by this shard
+    selected_episode_indices = None
+    if num_shards is not None and shard_index is not None:
+        # For selection, enumerate legacy episodes.jsonl length
+        episodes_legacy = legacy_load_episodes(src_root)
+        total = len(episodes_legacy)
+        selected_episode_indices = [i for i in range(total) if i % num_shards == shard_index]
 
-    shutil.move(str(root), str(old_root))
-    shutil.move(str(new_root), str(root))
-
-    hub_api = HfApi()
-    try:
-        hub_api.delete_tag(repo_id, tag=CODEBASE_VERSION, repo_type="dataset")
-    except HTTPError as e:
-        print(f"tag={CODEBASE_VERSION} probably doesn't exist. Skipping exception ({e})")
-        pass
-    hub_api.delete_files(
-        delete_patterns=["data/chunk*/episode_*", "meta/*.jsonl", "videos/chunk*"],
-        repo_id=repo_id,
-        revision=branch,
-        repo_type="dataset",
+    convert_info(src_root, tmp_root, data_file_size_in_mb, video_file_size_in_mb)
+    convert_tasks(src_root, tmp_root)
+    episodes_metadata, original_indices = convert_data(
+        src_root, tmp_root, data_file_size_in_mb, selected_episode_indices
     )
-    hub_api.create_tag(repo_id, tag=CODEBASE_VERSION, revision=branch, repo_type="dataset")
+    episodes_videos_metadata = convert_videos(
+        src_root, tmp_root, video_file_size_in_mb, selected_episode_indices
+    )
+    convert_episodes_metadata(
+        src_root,
+        tmp_root,
+        episodes_metadata,
+        episodes_videos_metadata,
+        selected_original_episode_indices=original_indices,
+    )
 
-    LeRobotDataset(repo_id).push_to_hub()
+    # Atomically move tmp to final root
+    if root.is_dir():
+        shutil.rmtree(root)
+    shutil.move(str(tmp_root), str(root))
+
+    if push_to_hub and (num_shards is None):
+        hub_api = HfApi()
+        try:
+            hub_api.delete_tag(repo_id, tag=CODEBASE_VERSION, repo_type="dataset")
+        except HTTPError as e:
+            print(f"tag={CODEBASE_VERSION} probably doesn't exist. Skipping exception ({e})")
+            pass
+        hub_api.delete_files(
+            delete_patterns=["data/chunk*/episode_*", "meta/*.jsonl", "videos/chunk*"],
+            repo_id=repo_id,
+            revision=branch,
+            repo_type="dataset",
+        )
+        hub_api.create_tag(repo_id, tag=CODEBASE_VERSION, revision=branch, repo_type="dataset")
+        LeRobotDataset(repo_id).push_to_hub()
 
 
 if __name__ == "__main__":
@@ -494,6 +570,29 @@ if __name__ == "__main__":
         type=int,
         default=None,
         help="File size in MB. Defaults to 100 for data and 500 for videos.",
+    )
+    parser.add_argument(
+        "--num-shards",
+        type=int,
+        default=None,
+        help="If provided with --shard-index, convert only a subset of episodes assigned to this shard.",
+    )
+    parser.add_argument(
+        "--shard-index",
+        type=int,
+        default=None,
+        help="Index of the shard in [0, num_shards).",
+    )
+    parser.add_argument(
+        "--out-repo-id",
+        type=str,
+        default=None,
+        help="Optional output repo id (local path base). Defaults to repo-id or repo-id_world_N_rank_R when sharded.",
+    )
+    parser.add_argument(
+        "--push-to-hub",
+        action="store_true",
+        help="When set, push the converted dataset to the hub (only in non-sharded mode).",
     )
 
     args = parser.parse_args()

@@ -319,3 +319,93 @@ Dataset v3.0 provides significant improvements for large datasets:
 - **Memory efficiency**: Better RAM usage through memory mapping
 - **Scalable processing**: Handles millions of episodes efficiently
 - **Storage optimization**: Reduced file count and improved compression
+
+## Distributed Migration from Dataset v2.1 (Local or SLURM)
+
+For datasets already on the Hub with a v2.1 history (e.g., `revision="v2.1"`), you can convert to v3.0 in a distributed way to handle large-scale ports efficiently.
+
+### 1) Sharded Conversion (Local execution)
+
+This creates N shards locally, each writing a valid v3.0 slice using episode-based partitioning:
+
+```bash
+python examples/port_datasets/port_v21_shards.py \
+  --repo-id lerobot/svla_so101_pickplace \
+  --logs-dir /tmp/lerobot-logs \
+  --workers 4 --slurm 0
+```
+
+- Output shards are stored under `~/.cache/huggingface/lerobot/<repo>_world_<N>_rank_<r>`.
+
+### 2) Aggregate shards into a single dataset
+
+```bash
+python examples/port_datasets/aggregate_v21_shards.py \
+  --base-repo-id lerobot/svla_so101_pickplace \
+  --workers 4 \
+  --aggregated-repo-id lerobot/svla_so101_pickplace_converted \
+  --logs-dir /tmp/lerobot-logs --slurm 0
+```
+
+- The aggregated dataset will be at `~/.cache/huggingface/lerobot/lerobot/svla_so101_pickplace_converted`.
+
+### 3) Validate against ground-truth v3.0 (local, no Hub required)
+
+Use the validator to compare frame-by-frame with the official v3.0 revision, entirely locally when you provide `--source-root` and `--target-root`:
+
+```bash
+python examples/port_datasets/validate_v21_conversion.py \
+  --source-v3-repo-id lerobot/svla_so101_pickplace \
+  --target-repo-id lerobot/svla_so101_pickplace_converted \
+  --source-root ~/.cache/huggingface/lerobot/lerobot/svla_so101_pickplace \
+  --target-root ~/.cache/huggingface/lerobot/lerobot/svla_so101_pickplace_converted \
+  --max-frames 100 --check-images
+```
+
+Notes:
+- The validator uses streaming locally (no Hub calls) and ignores benign schema diffs on internal indexing keys.
+- If you re-run jobs and see "Not doing anything as tasks have already been completed", change `--job-name` or clear the logs directory.
+
+### 4) Optional: SLURM execution
+
+You can run the sharded conversion via SLURM by setting `--slurm 1` and tuning resources (similar to the DROID example):
+
+```bash
+python examples/port_datasets/port_v21_shards.py \
+  --repo-id lerobot/svla_so101_pickplace \
+  --logs-dir /your/logs \
+  --job-name port_v21 \
+  --slurm 1 \
+  --workers 512 \
+  --partition your_partition \
+  --cpus-per-task 8 \
+  --mem-per-cpu 1950M
+```
+
+Then aggregate with:
+
+```bash
+python examples/port_datasets/aggregate_v21_shards.py \
+  --base-repo-id lerobot/svla_so101_pickplace \
+  --workers 512 \
+  --aggregated-repo-id your_id/svla_so101_pickplace_converted \
+  --logs-dir /your/logs \
+  --job-name aggr_v21 \
+  --slurm 1
+```
+
+### 5) Upload to the Hub (optional)
+
+After aggregation, you can upload using the existing uploader:
+
+```bash
+python examples/port_datasets/slurm_upload.py \
+  --repo-id lerobot/svla_so101_pickplace_converted \
+  --logs-dir /your/logs \
+  --slurm 0 --workers 1
+```
+
+Troubleshooting:
+- Ensure `meta/info.json` exists for both source and aggregated datasets locally.
+- If the validator tries to hit the Hub, verify `--source-root`/`--target-root` paths and that `data/*.parquet` and `videos/*/*.mp4` are present.
+- For repeated runs, delete `/tmp/lerobot-logs/<job-name>` or pass a new `--job-name`.
